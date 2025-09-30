@@ -10,7 +10,7 @@
         # Option 1: Automatic Device Scanning
         # If set to 'true', the driver will ignore 'port' and 'baudrate' settings.
         # It will automatically scan all ports and select the first device found.
-        scan_for_devices: true
+        scan_for_devices: false
 
         # Option 2: Manual Device Configuration
         # If you prefer to manually specify the device port and baudrate,
@@ -55,7 +55,7 @@
         # Transform Frame ID
         # ------------------
         # Default frame_id is "imu_link". Change this if using multiple devices to avoid conflicts.
-        frame_id: "imu_link"
+        frame_id: "movella_imu_link"
 
 
         # Sensor Configuration
