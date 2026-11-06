@@ -16,7 +16,7 @@ def generate_launch_description():
 
     namespace_arg = DeclareLaunchArgument(
         'namespace',
-        default_value='marinero',  # Change this to your preferred default namespace
+        default_value='xsens',  # Must match the xsens driver namespace (relative nmea/rtcm topics)
         description='Namespace for the ntrip_client'
     )
 

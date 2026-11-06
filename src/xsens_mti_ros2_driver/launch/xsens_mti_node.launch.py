@@ -20,12 +20,20 @@ def generate_launch_description():
     ld.add_action(namespace_arg)
 
     parameters_file_path = Path(get_package_share_directory('xsens_mti_ros2_driver'), 'param', 'xsens_mti_node.yaml')
+
+    config_file_arg = DeclareLaunchArgument(
+        'config_file',
+        default_value=str(parameters_file_path),
+        description='Parameter override YAML loaded after the package default'
+    )
+    ld.add_action(config_file_arg)
+
     xsens_mti_node = Node(
             package='xsens_mti_ros2_driver',
             executable='xsens_mti_node',
             name='xsens_mti_node',
             output='screen',
-            parameters=[parameters_file_path],
+            parameters=[parameters_file_path, LaunchConfiguration('config_file')],
             arguments=[]
             )
 
