@@ -38,12 +38,16 @@
 #include <xstypes/xsmessage.h>
 #include <xstypes/xsfilterprofile.h>
 #include <xstypes/xsfilterprofilearray.h>
+#include <xstypes/xstypedefs.h>
+#include <xstypes/xsdatapacket.h>
 
 #include "messagepublishers/packetcallback.h"
 #include "messagepublishers/accelerationpublisher.h"
 #include "messagepublishers/angularvelocitypublisher.h"
 #include "messagepublishers/freeaccelerationpublisher.h"
 #include "messagepublishers/gnsspublisher.h"
+#include "messagepublishers/gnsspvtpublisher.h"
+#include "messagepublishers/gnssatinfopublisher.h"
 #include "messagepublishers/imupublisher.h"
 #include "messagepublishers/magneticfieldpublisher.h"
 #include "messagepublishers/orientationincrementspublisher.h"
@@ -64,13 +68,16 @@
 #include "messagepublishers/accelerationhrpublisher.h"
 #include "messagepublishers/angularvelocityhrpublisher.h"
 #include "messagepublishers/odometrypublisher.h"
+#include "messagepublishers/shipmotionpublisher.h"
 #include "xsens_log_handler.h"
+#include "xsens_diagnostics.h"
+#include "serial_low_latency.h"
 
 #include <chrono>
 
 #define XS_DEFAULT_BAUDRATE (115200)
 
-XdaInterface::XdaInterface(rclcpp::Node::SharedPtr node)
+XdaInterface::XdaInterface(DriverNode::SharedPtr node)
     : m_device(nullptr), m_xdaCallback(node), m_node(node), m_productCode("")
 {
 	RCLCPP_INFO(node->get_logger(), "Creating XsControl object...");
@@ -86,12 +93,21 @@ XdaInterface::~XdaInterface()
 	m_control->destruct();
 }
 
+void XdaInterface::setDiagnostics(std::shared_ptr<XsensDiagnostics> diagnostics)
+{
+	m_diagnostics = diagnostics;
+	m_xdaCallback.setDiagnostics(diagnostics);
+}
+
 void XdaInterface::spinFor(std::chrono::milliseconds timeout)
 {
 	RosXsDataPacket rosPacket = m_xdaCallback.next(timeout);
 
 	if (!rosPacket.second.empty())
 	{
+		if (m_diagnostics)
+			m_diagnostics->recordPacket(rosPacket.second);
+
 		for (auto &cb : m_callbacks)
 		{
 			cb->operator()(rosPacket.second, rosPacket.first);
@@ -103,8 +119,10 @@ void XdaInterface::registerPublishers()
 {
 	bool should_publish;
 	bool isDeviceVruAhrs = m_device->deviceId().isAhrs() || m_device->deviceId().isVru();
-	bool isDeviceGnss = m_device->deviceId().isGnss();
+	// Sirius/Avior RTK IDs match isRtk(), not isGnss().
+	bool isDeviceGnss = m_device->deviceId().isGnss() || m_device->deviceId().isRtk();
 	bool isDeviceGnssRtk = m_device->deviceId().isRtk();
+	bool isDeviceSiriusAvior = m_device->deviceId().isSirius() || m_device->deviceId().isAvior();
 
 	if (m_node->get_parameter("pub_acceleration", should_publish) && should_publish)
 	{
@@ -157,12 +175,13 @@ void XdaInterface::registerPublishers()
 		registerCallback(new AngularVelocityHRPublisher(m_node));
 	}
 
+	if (m_node->get_parameter("pub_imu", should_publish) && should_publish)
+	{
+		registerCallback(new ImuPublisher(m_node, m_device->deviceId(), true));
+	}
+
 	if(isDeviceVruAhrs || isDeviceGnss)
 	{
-		if (m_node->get_parameter("pub_imu", should_publish) && should_publish)
-		{
-			registerCallback(new ImuPublisher(m_node));
-		}
 		if (m_node->get_parameter("pub_quaternion", should_publish) && should_publish)
 		{
 			registerCallback(new OrientationPublisher(m_node));
@@ -177,7 +196,20 @@ void XdaInterface::registerPublishers()
 		}
 		if (m_node->get_parameter("pub_transform", should_publish) && should_publish)
 		{
-			registerCallback(new TransformPublisher(m_node));
+			bool odometry_enabled = false;
+			m_node->get_parameter("pub_odometry", odometry_enabled);
+			if (isDeviceGnss && odometry_enabled)
+				RCLCPP_WARN(m_node->get_logger(), "pub_transform suppressed while pub_odometry is enabled; use pub_odometry_tf for standalone sensor TF");
+			else
+				registerCallback(new TransformPublisher(m_node));
+		}
+		//device is sirius or avior
+		if(isDeviceSiriusAvior)
+		{
+			if (m_node->get_parameter("pub_ship_motion", should_publish) && should_publish)
+			{
+				registerCallback(new ShipMotionPublisher(m_node));
+			}
 		}
 
 	}
@@ -216,14 +248,24 @@ void XdaInterface::registerPublishers()
 			//RCLCPP_INFO(m_node->get_logger(), "registerCallback ODOMETRYPublisher....");
 			registerCallback(new ODOMETRYPublisher(m_node));
 		}
+		if (m_node->get_parameter("pub_gnsspvt", should_publish) && should_publish)
+		{
+			registerCallback(new GnssPvtPublisher(m_node));
+		}
+		// Satellite info is only available on MTi-670(G), MTi-680(G), and MTi-G-710
+		if ((m_device->deviceId().isMti6X0() || m_device->deviceId().isMtig()) &&
+			m_node->get_parameter("pub_gnssatinfo", should_publish) && should_publish)
+		{
+			registerCallback(new GnssSatInfoPublisher(m_node));
+		}
 	}
 
 	//For RTK GNSS/INS MTi-8, MTi-680(G), we need to subscribe to a rostopic /rtcm.
 	if(isDeviceGnssRtk)
 	{
 		m_rtcmSubscription = m_node->create_subscription<mavros_msgs::msg::RTCM>(
-			"/rtcm", 
-			100, 
+			"/rtcm",
+			100,
 			std::bind(&XdaInterface::rtcmCallback, this, std::placeholders::_1)
 		);
 		RCLCPP_INFO(m_node->get_logger(), "Subscribing to /rtcm rostopic");
@@ -316,9 +358,19 @@ bool XdaInterface::connectDevice()
 
 	RCLCPP_INFO(m_node->get_logger(), "Found a device with ID: %s @ port: %s, baudrate: %d", mtPort.deviceId().toString().toStdString().c_str(), mtPort.portName().toStdString().c_str(), XsBaud::rateToNumeric(mtPort.baudrate()));
 
+	// Best-effort latency reduction, applied before XDA opens the port. A failure
+	// here is not fatal: the driver works at the port's default latency.
+	bool enableLowLatency = false;
+	if (m_node->get_parameter("enable_low_latency", enableLowLatency) && enableLowLatency)
+		xsens::setSerialLowLatency(mtPort.portName().toStdString(), m_node->get_logger());
+
 	RCLCPP_INFO(m_node->get_logger(), "Opening port %s ...", mtPort.portName().toStdString().c_str());
 	if (!m_control->openPort(mtPort))
 		return handleError("Could not open port");
+
+	// Remember the port so that close() can actually release it again, which the
+	// lifecycle 'cleanup' transition relies on.
+	m_port = mtPort;
 
 	m_device = m_control->device(mtPort.deviceId());
 	assert(m_device != 0);
@@ -372,11 +424,21 @@ bool XdaInterface::connectDevice()
 
 	m_device->addCallbackHandler(&m_xdaCallback);
 
+	if (m_diagnostics)
+	{
+		m_diagnostics->setDeviceInfo(m_productCode.toStdString(),
+									 m_device->deviceId().toString().toStdString(),
+									 firmwareVersion.toString().toStdString(),
+									 mtPort.portName().toStdString(),
+									 XsBaud::rateToNumeric(mtPort.baudrate()));
+		m_diagnostics->setConnected(true);
+	}
+
 	return true;
 }
 
 
-bool XdaInterface::prepare()
+bool XdaInterface::configureDevice()
 {
 	assert(m_device != 0);
 
@@ -399,7 +461,7 @@ bool XdaInterface::prepare()
 		}
 		else
 		{
-			RCLCPP_WARN(m_node->get_logger(), "Rosnode time_option is using host controller's ros time, no recommended, use MT Manager - Device Settings - Output Configurations to select utc time or sample time fine, and set time_option to 0 or 1 in the xsens_mti_node.yaml file. ");
+			RCLCPP_WARN(m_node->get_logger(), "Rosnode time_option is using host controller's ros time.");
 		}
 	}
 
@@ -408,12 +470,23 @@ bool XdaInterface::prepare()
 	if (!m_device->readEmtsAndDeviceConfiguration())
 		return handleError("Could not read device configuration");
 
+	return true;
+}
+
+
+bool XdaInterface::startMeasurement()
+{
+	assert(m_device != 0);
+
 	RCLCPP_INFO(m_node->get_logger(), "Measuring ..");
 	if (!m_device->gotoMeasurement())
 		return handleError("Could not put device into measurement mode");
 
+	if (m_diagnostics)
+		m_diagnostics->setMeasuring(true);
+
 	bool enable_logging = false;
-	
+
 	if(m_node->get_parameter("enable_logging", enable_logging) && enable_logging)
 	{
 		XsensLogHandler logHandler;
@@ -432,14 +505,42 @@ bool XdaInterface::prepare()
 
 	//delay 0.05 second, as the previous actions might take a little delay.
 	rclcpp::sleep_for(std::chrono::milliseconds(50));
-	
+
 	//in any case, send MGBE in the beginning for 6 seconds.
-	manualGyroBiasEstimation(6);
+	manualGyroBiasEstimation(0, 6);
 
 	// Setup Periodic Manual Gyro Bias Estimation
     setupManualGyroBiasEstimation();
 
 	return true;
+}
+
+
+void XdaInterface::stopMeasurement()
+{
+	// Drop the periodic gyro bias estimation so it is not re-created on the next
+	// activation and does not talk to a device that is back in config mode.
+	m_manualGyroBiasTimer.reset();
+	m_manualGyroBiasSubscriber.reset();
+
+	if (m_device != nullptr)
+	{
+		m_device->stopRecording();
+		m_device->closeLogFile();
+
+		RCLCPP_INFO(m_node->get_logger(), "Leaving measurement mode ..");
+		if (!m_device->gotoConfig())
+			RCLCPP_WARN(m_node->get_logger(), "Could not put device back into config mode.");
+	}
+
+	if (m_diagnostics)
+		m_diagnostics->setMeasuring(false);
+}
+
+
+bool XdaInterface::prepare()
+{
+	return configureDevice() && startMeasurement();
 }
 
 
@@ -452,7 +553,7 @@ bool XdaInterface::prepare()
  * parameter to decide whether the MGBE should be enabled, and 'manual_gyro_bias_param' for the parameters required
  * for the estimation process, which includes the event interval and duration for the MGBE.
  */
-bool XdaInterface::manualGyroBiasEstimation(uint16_t duration)
+bool XdaInterface::manualGyroBiasEstimation(uint16_t sleep, uint16_t duration)
 {
 	// Check if duration is less than 2; if so, set it to 2
     if (duration < 2)
@@ -460,6 +561,9 @@ bool XdaInterface::manualGyroBiasEstimation(uint16_t duration)
         RCLCPP_INFO(m_node->get_logger(), "Duration is less than 2 seconds, setting it to 2 seconds.");
         duration = 2;
     }
+
+    if (sleep > 0)
+		rclcpp::sleep_for(std::chrono::milliseconds(sleep));
 
 	XsMessage snd(XMID_SetNoRotation, sizeof(uint16_t));
 	XsMessage rcv;
@@ -486,8 +590,11 @@ void XdaInterface::setupManualGyroBiasEstimation()
     bool enable_manual_gyro_bias = false;
 	//assign default value {10,3} to manual_gyro_bias_param
     std::vector<long int>  manual_gyro_bias_param = {10, 3};
-	m_node->declare_parameter("enable_manual_gyro_bias", enable_manual_gyro_bias);
-	m_node->declare_parameter("manual_gyro_bias_param",manual_gyro_bias_param);
+	// Guarded, because this runs again on every lifecycle activation.
+	if (!m_node->has_parameter("enable_manual_gyro_bias"))
+		m_node->declare_parameter("enable_manual_gyro_bias", enable_manual_gyro_bias);
+	if (!m_node->has_parameter("manual_gyro_bias_param"))
+		m_node->declare_parameter("manual_gyro_bias_param",manual_gyro_bias_param);
 
 	if(m_node->get_parameter("enable_manual_gyro_bias", enable_manual_gyro_bias) && m_node->get_parameter("manual_gyro_bias_param", manual_gyro_bias_param))
 	{
@@ -499,7 +606,7 @@ void XdaInterface::setupManualGyroBiasEstimation()
 				int event_interval = manual_gyro_bias_param[0];
 				int duration = manual_gyro_bias_param[1];
 
-				if (event_interval < 10)
+				if (event_interval > 0 && event_interval < 10)
 				{
 					RCLCPP_INFO(m_node->get_logger(), "Event interval is less than 10 seconds, setting it to 10 seconds.");
 					event_interval = 10;
@@ -511,10 +618,19 @@ void XdaInterface::setupManualGyroBiasEstimation()
 				}
 
 				// Start the timer for MGBE with the retrieved parameters
-				m_manualGyroBiasTimer = m_node->create_wall_timer(
-					std::chrono::seconds(event_interval),
-					[this, duration]() { this->manualGyroBiasEstimation(duration); }
+				if (event_interval > 0) {
+                    m_manualGyroBiasTimer = m_node->create_wall_timer(
+                        std::chrono::seconds(event_interval),
+                        [this, duration]() { this->manualGyroBiasEstimation(0, duration); }
+                    );
+                }
+
+				// Start the subscriber for MGBE with the retrieved parameters
+				m_manualGyroBiasSubscriber = m_node->create_subscription<std_msgs::msg::Empty>(
+				    "gyro_bias_trigger", 10,
+					[this, duration](const std_msgs::msg::Empty::SharedPtr msg) { this->manualGyroBiasEstimation(500, duration); }
 				);
+
 				RCLCPP_INFO(m_node->get_logger(), "Manual Gyro Bias Estimation enabled. Interval: %d seconds, Duration: %d seconds.", event_interval, duration);
 				event_interval += duration;
 			}
@@ -546,13 +662,26 @@ void XdaInterface::rtcmCallback(const mavros_msgs::msg::RTCM::SharedPtr msg)
 
 void XdaInterface::close()
 {
+	m_manualGyroBiasTimer.reset();
+	m_manualGyroBiasSubscriber.reset();
+	m_rtcmSubscription.reset();
+
 	if (m_device != nullptr)
 	{
 		m_device->stopRecording();
 		m_device->closeLogFile();
 		m_device->removeCallbackHandler(&m_xdaCallback);
+		m_device = nullptr;
 	}
 	m_control->closePort(m_port);
+
+	clearCallbacks();
+
+	if (m_diagnostics)
+	{
+		m_diagnostics->setMeasuring(false);
+		m_diagnostics->setConnected(false);
+	}
 }
 
 
@@ -560,6 +689,15 @@ void XdaInterface::close()
 void XdaInterface::registerCallback(PacketCallback *cb)
 {
 	m_callbacks.push_back(cb);
+}
+
+void XdaInterface::clearCallbacks()
+{
+	for (auto &cb : m_callbacks)
+	{
+		delete cb;
+	}
+	m_callbacks.clear();
 }
 
 bool XdaInterface::handleError(std::string error)
@@ -592,14 +730,15 @@ bool XdaInterface::configureSensorSettings()
 
 	if (!m_device->gotoConfig())
 		return handleError("Could not go to config");
-	
+
 	if (enable_deviceConfig)
-	{	
+	{
 
 		XsVersion firmwareVersion = m_device->firmwareVersion();
-		bool isDeviceGnssIns = m_device->deviceId().isGnss();
-		bool isDeviceVruAhrs = m_device->deviceId().isAhrs() || m_device->deviceId().isVru();
-		bool isMTiX = m_device->deviceId().isMtiX(); // check if it is MTi-1/2/3/7/8
+		XsDeviceId xsens_device_id = m_device->deviceId();
+		bool isDeviceGnssIns = xsens_device_id.isGnss() || xsens_device_id.isRtk();
+		bool isDeviceVruAhrs = xsens_device_id.isAhrs() || xsens_device_id.isVru();
+		bool isMTiX = xsens_device_id.isMtiX(); // check if it is MTi-1/2/3/7/8
 
 		//use ros param get to get output_data_rate
 		int ODRoption = 100;
@@ -615,7 +754,7 @@ bool XdaInterface::configureSensorSettings()
 				{
 					RCLCPP_WARN(m_node->get_logger(), "output_data_rate is got but set over 400Hz, using default 100Hz");
 				}
-				
+
 			}
 			else
 			{
@@ -649,10 +788,26 @@ bool XdaInterface::configureSensorSettings()
 		//for theses output, always output.
 		configArray.push_back(XsOutputConfiguration(XDI_PacketCounter, 0));
 		configArray.push_back(XsOutputConfiguration(XDI_SampleTimeFine, 0));
-		configArray.push_back(XsOutputConfiguration(XDI_UtcTime, 0));
+		// UTC Time is configured when 'pub_utctime' asks for it, and also whenever
+		// 'time_option' is 0, because that option derives message stamps from the
+		// device's UTC clock and breaks without this output. Dropping UTC Time
+		// matters on bandwidth-limited setups: on an MTi-630 at 2 Mbps, acc_hr
+		// 2000 Hz + gyro_hr 1600 Hz + 400 Hz primary outputs overflows with it and
+		// is overflow-free without it.
+		bool configUtcTime = true;
+		m_node->get_parameter("pub_utctime", configUtcTime);
+		int timeOption = 0;
+		m_node->get_parameter("time_option", timeOption);
+		if (!configUtcTime && timeOption == 0)
+		{
+			RCLCPP_WARN(m_node->get_logger(), "pub_utctime is false but time_option is 0, which needs UTC Time from the device. Keeping UTC Time in the output configuration; set time_option to 1 or 2 to drop it.");
+			configUtcTime = true;
+		}
+		if (configUtcTime)
+			configArray.push_back(XsOutputConfiguration(XDI_UtcTime, 0));
 		//ROS_INFO print the config names and frequencies
-		RCLCPP_INFO(m_node->get_logger(), "XDI_PacketCounter, XDI_SampleTimeFine, XDI_UtcTime");
-		//use ros param to check pub_utctime, if yes, then push back it
+		RCLCPP_INFO(m_node->get_logger(), "XDI_PacketCounter, XDI_SampleTimeFine%s",
+			configUtcTime ? ", XDI_UtcTime" : " (UTC Time omitted, pub_utctime is false)");
 		bool should_config = false;
 		//for these data, all mti series have them.
 		if(m_node->get_parameter("pub_acceleration", should_config) && should_config)
@@ -729,6 +884,16 @@ bool XdaInterface::configureSensorSettings()
 			}
 		}
 
+		// Configure Euler angles standard deviation output for Sirius or Avior devices
+		if ((xsens_device_id.isAvior() || xsens_device_id.isSirius()))
+		{
+			if (m_node->get_parameter("pub_euler_stddev", should_config) && should_config)
+			{
+				configArray.push_back(XsOutputConfiguration(XDI_EulerAnglesStd, ODRoption));
+				RCLCPP_INFO(m_node->get_logger(), "XDI_EulerAnglesStd, %dHz", ODRoption);
+			}
+		}
+
 		bool enableHRData = false;
 		if (m_node->get_parameter("enable_high_rate", enableHRData) && enableHRData)
 		{
@@ -747,7 +912,7 @@ bool XdaInterface::configureSensorSettings()
 			}
 
 		}
-		
+
 
 		if(isDeviceVruAhrs || isDeviceGnssIns)
 		{
@@ -775,6 +940,16 @@ bool XdaInterface::configureSensorSettings()
 				{
 					configArray.push_back(XsOutputConfiguration(XDI_FreeAcceleration, ODRoption));
 					RCLCPP_INFO(m_node->get_logger(), "XDI_FreeAcceleration, %dHz", ODRoption);
+				}
+			}
+			//heave position only for Avior and Sirius AHRS/VRU models
+			if ((xsens_device_id.isAvior() || xsens_device_id.isSirius()))
+			{
+				if (m_node->get_parameter("pub_ship_motion", should_config) && should_config)
+				{
+					configArray.push_back(XsOutputConfiguration(XDI_HeavePosition, ODRoptionLower));
+					configArray.push_back(XsOutputConfiguration(XDI_HeavePeriod, ODRoptionLower));
+					RCLCPP_INFO(m_node->get_logger(), "XDI_HeavePosition and XDI_HeavePeriod, %dHz", ODRoptionLower);
 				}
 			}
 		}
@@ -813,7 +988,7 @@ bool XdaInterface::configureSensorSettings()
 
 			//baro for mti-7/8 max 50Hz, for mti-670/680 max 100Hz.
 			if (m_node->get_parameter("pub_pressure", should_config) && should_config)
-			{	
+			{
 				//if it is mtix, max is 50(output_data_rate_baro_mtione), if not, max is 100(use ODRoptionLower).
 				if(isMTiX)
 				{
@@ -864,22 +1039,23 @@ bool XdaInterface::configureSensorSettings()
 		RCLCPP_INFO(m_node->get_logger(), "Sensor output configured successfully.");
 
 
-		
+
 		//ROS_INFO print the 5th to 7th characters of the product code to check if it is mti-680(G) or other mti-600 models.
-		bool isMTi620 = false;
-		bool isMTi630 = false;
 		bool isMTi670 = false;
 		bool isMTi680 = false;
 		bool isMTiG710 = false;
-		isMTi620 = m_productCode.toStdString().substr(4, 3) == "620";
-		isMTi630 = m_productCode.toStdString().substr(4, 3) == "630";
+		bool isModernSensor = false;
+		bool isModernVruAhrs = false;
 		isMTi670 = m_productCode.toStdString().substr(4, 3) == "670";
 		isMTi680 = m_productCode.toStdString().substr(4, 3) == "680";
-		isMTiG710 = m_device->deviceId().isMtig();
+		isMTiG710 = xsens_device_id.isMtig();
+		isModernSensor = xsens_device_id.isAvior() || xsens_device_id.isSirius() || xsens_device_id.isMti6X0();
+		isModernVruAhrs = isModernSensor && isDeviceVruAhrs;
+
 
 		RCLCPP_INFO(m_node->get_logger(), "Configuring Option Flags.....");
 		//TODO: check if MTi-100 has this feature or not...
-		if(!m_device->deviceId().isImu())
+		if(!xsens_device_id.isImu())
 		{
 			//enable_inrun_compass_calibration
 			bool enable_inrun_compass_calibration = false;
@@ -887,7 +1063,7 @@ bool XdaInterface::configureSensorSettings()
 			{
 				if(enable_inrun_compass_calibration)
 				{
-					
+
 					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnableInrunCompassCalibration, XsDeviceOptionFlag::XDOF_None))
 					{
 						RCLCPP_INFO(m_node->get_logger(), "Enable In-run Compass Calibration Success!");
@@ -911,10 +1087,46 @@ bool XdaInterface::configureSensorSettings()
 
 			}
 
+			bool enable_rotsensor_frame_config = false;
+			if(m_node->get_parameter("enable_rotsensor_frame_config", enable_rotsensor_frame_config)&& enable_rotsensor_frame_config)
+			{
+				std::vector<double> rotsensor_rotation_euler = {0.0, 0.0, 0.0};
+				if (!m_node->has_parameter("rotsensor_rotation_euler"))
+					m_node->declare_parameter("rotsensor_rotation_euler",rotsensor_rotation_euler);
+				if(m_node->get_parameter("rotsensor_rotation_euler", rotsensor_rotation_euler))
+				{
+					//change sensor's RotSensor frame by euler angles, roll, pitch, yaw
+					XsEuler rotsensor_euler(rotsensor_rotation_euler[0],
+						rotsensor_rotation_euler[1],
+						rotsensor_rotation_euler[2]);
+					RCLCPP_INFO(m_node->get_logger(),
+                       "Setting rotsensor alignment rotation from Euler angles (roll: %.2fdeg, pitch: %.2fdeg, yaw: %.2fdeg)...",
+                       rotsensor_euler.roll(), rotsensor_euler.pitch(), rotsensor_euler.yaw());
+
+					// Convert Euler angles to quaternion
+					XsQuaternion rotsensor_quat(rotsensor_euler);
+
+					// Normalize the quaternion
+					rotsensor_quat.normalize();
+
+					// Apply the alignment rotation quaternion to the device
+					if (!m_device->setAlignmentRotationQuaternion(XAF_Sensor, rotsensor_quat)) {
+						RCLCPP_WARN(m_node->get_logger(), "Failed to set alignment rotation quaternion");
+						return false;
+					} else {
+						RCLCPP_INFO(m_node->get_logger(), "Successfully set alignment rotation from Euler angles");
+						return true;
+					}
+				}
+			}
 		}
 		//AHS is for MTI-2/3/320, MTI-200/300, but for MTI-620/630, it is on the filter profile VRUAHS.
-		//not imu, not gnss, not 600
-		if(!m_device->deviceId().isImu() && !m_device->deviceId().isGnss() && !m_device->deviceId().isMti6X0())
+		//not imu, not gnss, not 600, not avior, not sirius
+		if(!xsens_device_id.isImu() && 
+			!xsens_device_id.isGnss() && 
+			!xsens_device_id.isMti6X0() && 
+			!xsens_device_id.isAvior() && 
+			!xsens_device_id.isSirius())
 		{
 			//enable_active_heading_stabilization
 			bool enable_active_heading_stabilization = false;
@@ -922,8 +1134,8 @@ bool XdaInterface::configureSensorSettings()
 			{
 				if(enable_active_heading_stabilization)
 				{
-					
-					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnableInrunCompassCalibration, XsDeviceOptionFlag::XDOF_None))
+
+					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnableAhs, XsDeviceOptionFlag::XDOF_None))
 					{
 						RCLCPP_INFO(m_node->get_logger(), "Enable Active Heading Stabilization Success!");
 					}
@@ -934,7 +1146,7 @@ bool XdaInterface::configureSensorSettings()
 				}
 				else
 				{
-					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_None, XsDeviceOptionFlag::XDOF_EnableInrunCompassCalibration))
+					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_None, XsDeviceOptionFlag::XDOF_EnableAhs))
 					{
 						RCLCPP_INFO(m_node->get_logger(), "Disable Active Heading Stabilization Success!");
 					}
@@ -949,19 +1161,19 @@ bool XdaInterface::configureSensorSettings()
 		}
 
 
-		
+
 
 
 		if (isMTi670 || isMTi680 || isMTiG710)
 		{
-			// use ros:param to get 
+			// use ros:param to get
 			//enable_orientation_smoother, enable_position_velocity_smoother, enable_continuous_zero_rotation_update
 			bool enable_orientation_smoother = false;
 			if(m_node->get_parameter("enable_orientation_smoother", enable_orientation_smoother))
 			{
 				if(enable_orientation_smoother)
 				{
-					
+
 					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnableOrientationSmoother, XsDeviceOptionFlag::XDOF_None))
 					{
 						RCLCPP_INFO(m_node->get_logger(), "Enable Orientation Smoother Success!");
@@ -994,7 +1206,7 @@ bool XdaInterface::configureSensorSettings()
 				{
 					if(enable_position_velocity_smoother)
 					{
-						
+
 						if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnablePositionVelocitySmoother, XsDeviceOptionFlag::XDOF_None))
 						{
 							RCLCPP_INFO(m_node->get_logger(), "Enable Position Velocity Smoother Success!");
@@ -1026,7 +1238,7 @@ bool XdaInterface::configureSensorSettings()
 				{
 					if(enable_continuous_zero_rotation_update)
 					{
-						
+
 						if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnableContinuousZRU, XsDeviceOptionFlag::XDOF_None))
 						{
 							RCLCPP_INFO(m_node->get_logger(), "Enable Continous Zero Rotation Update Success!");
@@ -1050,17 +1262,21 @@ bool XdaInterface::configureSensorSettings()
 
 				}
 			}
-			
+
 
 		}
-
-		RCLCPP_INFO(m_node->get_logger(), "Configuring GNSS relevant Prameters...");
+		if (xsens_device_id.isGnss() || xsens_device_id.isRtk())
+		{
+			RCLCPP_INFO(m_node->get_logger(), "Configuring GNSS relevant Prameters...");
+		}
+		
 
 		// read yaml config for gnss lever arm, only for MTI-8 or MTI-680(G):
-		if (m_device->deviceId().isRtk())
+		if (xsens_device_id.isRtk())
 		{
 			std::vector<double> gnssLeverArm = {0.0, 0.0, 0.0};
-			m_node->declare_parameter("GNSS_LeverArm",gnssLeverArm);
+			if (!m_node->has_parameter("GNSS_LeverArm"))
+				m_node->declare_parameter("GNSS_LeverArm",gnssLeverArm);
 			if(m_node->get_parameter("GNSS_LeverArm", gnssLeverArm))
 			{
 				if (gnssLeverArm.size() != 3)
@@ -1081,7 +1297,9 @@ bool XdaInterface::configureSensorSettings()
 		}
 
 
-		if (m_device->deviceId().isGnss())
+		// Preserve the original receiver-specific configuration scope. RTK-only
+		// Sirius/Avior devices still receive GNSS/INS output configuration above.
+		if (xsens_device_id.isGnss())
 		{
 			// Set the GNSS platform
 			XsUbloxGnssPlatform platform = XGP_Portable;
@@ -1104,7 +1322,7 @@ bool XdaInterface::configureSensorSettings()
 			{
 				if(enable_beidou)
 				{
-					
+
 					if(m_device->setDeviceOptionFlags(XsDeviceOptionFlag::XDOF_EnableBeidou, XsDeviceOptionFlag::XDOF_None))
 					{
 						RCLCPP_INFO(m_node->get_logger(), "Enable Beidou Success!");
@@ -1127,10 +1345,10 @@ bool XdaInterface::configureSensorSettings()
 				}
 
 			}
-			
+
 		}
 
-		
+
 		//set filter profiles
 		bool enable_filter_config = false;
 		if (m_node->get_parameter("enable_filter_config", enable_filter_config) && enable_filter_config)
@@ -1139,7 +1357,7 @@ bool XdaInterface::configureSensorSettings()
 			if(!onboardProfiles.empty())
 			{
 				int filterIndex = 0; // Initialize counter variable
-				std::map<int, std::string> profileDictionary; 
+				std::map<int, std::string> profileDictionary;
 				RCLCPP_INFO(m_node->get_logger(), "Got Onboard Filter Profiles: ");
 				for (XsFilterProfileArray::iterator it = onboardProfiles.begin(); it != onboardProfiles.end(); ++it, ++filterIndex)
 				{
@@ -1154,10 +1372,11 @@ bool XdaInterface::configureSensorSettings()
 				std::string rollpitchLabel = "Robust";
 				std::string yawLabel = "VRUAHS";
 				bool isGotFilterParam = false;
-				if(isMTi620 || isMTi630)
+				if(isModernVruAhrs)
 				{
-					if(m_node->get_parameter("mti620630filterlabel_rollpitch", rollpitchLabel) && m_node->get_parameter("mti620630filterlabel_yaw", yawLabel))
+					if(m_node->get_parameter("filter_label_rollpitch", rollpitchLabel) && m_node->get_parameter("filter_label_yaw", yawLabel))
 					{
+						RCLCPP_INFO(m_node->get_logger(), "Got filter labels for roll/pitch/yaw.");
 						isGotFilterParam = true;
 					}
 				}
@@ -1173,16 +1392,16 @@ bool XdaInterface::configureSensorSettings()
 						{
 							RCLCPP_WARN(m_node->get_logger(), "Your mti_filter_option %d is incorrect, it is bigger than index bound of 0 to %d, please check your model and correct the value at xsens_mti_node.yaml.", filterIndexToSet, (int)(onboardProfiles.size() - 1));
 						}
-						
+
 					}
 
 				}
-			
+
 
 				if(isGotFilterParam)
 				{
 					std::string profileContent = profileDictionary[filterIndexToSet];
-					if(m_device->deviceId().isMti6X0())
+					if(xsens_device_id.isMti6X0() || xsens_device_id.isAvior() || xsens_device_id.isSirius())
 					{
 						if(isMTi670 || isMTi680)
 						{
@@ -1198,9 +1417,9 @@ bool XdaInterface::configureSensorSettings()
 						}
 						else
 						{
-							//For MTI-620 or MTI-630, for example: "Responsive/VRU"
+							//For MTI-620/MTI-630 or Sirius/Avior AHRS, VRU, for example: "Responsive/VRU"
 							XsString filterToSet = XsString(rollpitchLabel) + XsString("/") + XsString(yawLabel);
-							
+
 								if(m_device->setOnboardFilterProfile(filterToSet))
 								{
 									RCLCPP_INFO(m_node->get_logger(), "Successfully Set Onboard Filter Option to Name: %s", filterToSet.c_str());
@@ -1227,10 +1446,10 @@ bool XdaInterface::configureSensorSettings()
 				}
 
 			}
-			
+
 
 		}
-		
+
 
 
 		//Lastly, set the baudrate.
@@ -1241,16 +1460,71 @@ bool XdaInterface::configureSensorSettings()
 			if(m_node->get_parameter("set_baudrate_value", setBaudrateParam))
 			{
 				RCLCPP_INFO(m_node->get_logger(), "baudrate parameter to set: %d", setBaudrateParam);
-				XsBaudRate baudrate = XBR_115k2;
-				baudrate = XsBaud::numericToRate(setBaudrateParam);
-
-				//set baudrate to 921600 if the above data output is too much, 400Hz.
+				XsBaudRate baudrate = XsBaud::numericToRate(setBaudrateParam);
+				
+				// Lambda function to configure baudrate for both modern and old sensors
+				auto configureBaudrate = [&](XsBaudRate rate) -> bool {
+					if (isModernSensor)
+					{
+						bool isHardwareFlowControlEnabled = true;
+						if(m_node->get_parameter("port_config_hardware_flow_control", isHardwareFlowControlEnabled))
+						{
+							RCLCPP_INFO(m_node->get_logger(), "port_config_hardware_flow_control parameter to set is %s.", 
+								isHardwareFlowControlEnabled ? "true" : "false");
+						}
+						
+						// Convert XsBaudRate to XsBaudCode
+						XsBaudCode baudCode = XsBaud::rateToCode(rate);
+						
+						// Port 0 Configuration (Port 0)
+						// Bits layout:
+						// - bits 0:7   = XsBaudCode
+						// - bit 8      = Enable flow control
+						// - bits 9-15  = 0 (8N1, no parity)
+						// - bits 16:19 = Protocol = 1 (Xbus)
+						int port0Config = 0;
+						port0Config |= (int)baudCode;                              // Bits 0-7: Baudrate code
+						port0Config |= (isHardwareFlowControlEnabled ? 1 : 0) << 8; // Bit 8: Hardware flow control
+						port0Config |= (1 << 16);                                  // Bits 16-19: Protocol = 1 (Xbus)
+						
+						// Port 1 Configuration (Port 1)
+						// Same baudrate, but no hardware flow control
+						int port1Config = 0;
+						port1Config |= (int)baudCode;  // Bits 0-7: Baudrate code
+						port1Config |= (0 << 8);       // Bit 8: No hardware flow control
+						port1Config |= (1 << 16);      // Bits 16-19: Protocol = 1 (Xbus)
+						
+						// Create config array for RS232, UART, and third port
+						XsIntArray config;
+						config.push_back(port0Config);  // RS232 port
+						config.push_back(port1Config);   // UART port
+						config.push_back(0);            // Third port (RS232 RTCM) - no configuration
+						
+						bool success = m_device->setPortConfiguration(config);
+						
+						if (success)
+						{
+							RCLCPP_INFO(m_node->get_logger(), 
+								"Port configuration set - Port 0: Baudrate=%d, HW Flow Control=%s | Port 1: Baudrate=%d, HW Flow Control=No",
+								XsBaud::rateToNumeric(rate),
+								isHardwareFlowControlEnabled ? "Yes" : "No",
+								XsBaud::rateToNumeric(rate));
+						}
+						
+						return success;
+					}
+					else
+					{
+						return m_device->setSerialBaudRate(rate);
+					}
+				};
+				
+				// Set baudrate to 2M if the data output is too much, >1000Hz
 				if (enableHRData)
 				{
 					baudrate = XBR_2000k;
-					if (!m_device->setSerialBaudRate(baudrate))
-						return handleError("Could not set baudrate to " + std::to_string(XsBaud::rateToNumeric(baudrate)));
-					
+					if (!configureBaudrate(baudrate))
+						return handleError("Could not set port configuration with baudrate " + std::to_string(XsBaud::rateToNumeric(baudrate)));
 					RCLCPP_INFO(m_node->get_logger(), "Since the HighRate Data is enabled, Sensor baudrate forcely configured to %d.", XsBaud::rateToNumeric(baudrate));
 				}
 				else
@@ -1258,26 +1532,23 @@ bool XdaInterface::configureSensorSettings()
 					if(ODRoption >= 400 && baudrate < XBR_921k6)
 					{
 						baudrate = XBR_921k6;
-						if (!m_device->setSerialBaudRate(baudrate))
+						if (!configureBaudrate(baudrate))
 							return handleError("Could not set baudrate to " + std::to_string(XsBaud::rateToNumeric(baudrate)));
-
 						RCLCPP_INFO(m_node->get_logger(), "Since 400Hz data is enabled, Sensor baudrate forcely configured to %d.", XsBaud::rateToNumeric(baudrate));
 					}
 					else
 					{
-						if (!m_device->setSerialBaudRate(baudrate))
+						if (!configureBaudrate(baudrate))
 							return handleError("Could not set baudrate to " + std::to_string(XsBaud::rateToNumeric(baudrate)));
-
 						RCLCPP_INFO(m_node->get_logger(), "Sensor baudrate configured to %d success.", XsBaud::rateToNumeric(baudrate));
-					}		
+					}
 				}
 			}
 			else
 			{
 				RCLCPP_WARN(m_node->get_logger(), "No set_baudrate_value parameter found, do not set baudrate.");
 			}
-
-		}
+		}	
 
 		//now we sleep a little while, since the configuration commands might take a little time.
 		rclcpp::sleep_for(std::chrono::milliseconds(50));
@@ -1298,71 +1569,126 @@ bool XdaInterface::configureSensorSettings()
 void XdaInterface::declareCommonParameters()
 {
 	// Declare ROS parameters common to all the publishers
-	m_node->declare_parameter("scan_for_devices", true);
-	m_node->declare_parameter("port", "/dev/ttyUSB0");
-	m_node->declare_parameter("baudrate", 115200);
-	m_node->declare_parameter("device_id", "");
-	m_node->declare_parameter("publisher_queue_size", 5);
-	m_node->declare_parameter("enable_logging", false);
-
+	if (!m_node->has_parameter("scan_for_devices"))
+		m_node->declare_parameter("scan_for_devices", true);
+	if (!m_node->has_parameter("port"))
+		m_node->declare_parameter("port", "/dev/ttyUSB0");
+	if (!m_node->has_parameter("baudrate"))
+		m_node->declare_parameter("baudrate", 115200);
+	if (!m_node->has_parameter("enable_low_latency"))
+		m_node->declare_parameter("enable_low_latency", false);
+	if (!m_node->has_parameter("device_id"))
+		m_node->declare_parameter("device_id", "");
+	if (!m_node->has_parameter("publisher_queue_size"))
+		m_node->declare_parameter("publisher_queue_size", 5);
+	if (!m_node->has_parameter("enable_logging"))
+		m_node->declare_parameter("enable_logging", false);
+	if (!m_node->has_parameter("odometry_frame_id"))
+		m_node->declare_parameter("odometry_frame_id", "local_enu");
+	if (!m_node->has_parameter("pub_odometry_tf"))
+		m_node->declare_parameter("pub_odometry_tf", false);
 	std::string frame_id = DEFAULT_FRAME_ID;
-	m_node->declare_parameter("frame_id", frame_id);
-
-	m_node->declare_parameter("enable_deviceConfig", false);
-	m_node->declare_parameter("enable_filter_config", false);
-	m_node->declare_parameter("mti_filter_option", 0);
-	m_node->declare_parameter("mti620630filterlabel_rollpitch", "Robust");
-	m_node->declare_parameter("mti620630filterlabel_yaw", "NorthReference");
-	m_node->declare_parameter("enable_active_heading_stabilization", false);
-
-	m_node->declare_parameter("ublox_platform", 0);
-	m_node->declare_parameter("enable_beidou", false);
-
-	m_node->declare_parameter("output_data_rate", 100);
-	m_node->declare_parameter("output_data_rate_lower", 100);
-	m_node->declare_parameter("output_data_rate_baro_mtione", 50);
-
-	m_node->declare_parameter("enable_high_rate", false);
-	m_node->declare_parameter("output_data_rate_acchr", 1000);
-	m_node->declare_parameter("output_date_rate_gyrohr", 800);
-
-	m_node->declare_parameter("enable_orientation_smoother", false);
-	m_node->declare_parameter("enable_position_velocity_smoother", false);
-	m_node->declare_parameter("enable_continuous_zero_rotation_update", false);
-	m_node->declare_parameter("enable_inrun_compass_calibration", false);
-	
-
-	m_node->declare_parameter("enable_setting_baudrate", false);
-	m_node->declare_parameter("set_baudrate_value", 115200);
-
-
+	if (!m_node->has_parameter("frame_id"))
+		m_node->declare_parameter("frame_id", frame_id);
+	if (!m_node->has_parameter("enable_deviceConfig"))
+		m_node->declare_parameter("enable_deviceConfig", false);
+	if (!m_node->has_parameter("enable_filter_config"))
+		m_node->declare_parameter("enable_filter_config", false);
+	if (!m_node->has_parameter("mti_filter_option"))
+		m_node->declare_parameter("mti_filter_option", 0);
+	if (!m_node->has_parameter("filter_label_rollpitch"))
+		m_node->declare_parameter("filter_label_rollpitch", "Robust");
+	if (!m_node->has_parameter("filter_label_yaw"))
+		m_node->declare_parameter("filter_label_yaw", "NorthReference");
+	if (!m_node->has_parameter("enable_active_heading_stabilization"))
+		m_node->declare_parameter("enable_active_heading_stabilization", false);
+	if (!m_node->has_parameter("ublox_platform"))
+		m_node->declare_parameter("ublox_platform", 0);
+	if (!m_node->has_parameter("enable_beidou"))
+		m_node->declare_parameter("enable_beidou", false);
+	if (!m_node->has_parameter("output_data_rate"))
+		m_node->declare_parameter("output_data_rate", 100);
+	if (!m_node->has_parameter("output_data_rate_lower"))
+		m_node->declare_parameter("output_data_rate_lower", 100);
+	if (!m_node->has_parameter("output_data_rate_baro_mtione"))
+		m_node->declare_parameter("output_data_rate_baro_mtione", 50);
+	if (!m_node->has_parameter("enable_high_rate"))
+		m_node->declare_parameter("enable_high_rate", false);
+	if (!m_node->has_parameter("output_data_rate_acchr"))
+		m_node->declare_parameter("output_data_rate_acchr", 1000);
+	if (!m_node->has_parameter("output_date_rate_gyrohr"))
+		m_node->declare_parameter("output_date_rate_gyrohr", 800);
+	if (!m_node->has_parameter("enable_orientation_smoother"))
+		m_node->declare_parameter("enable_orientation_smoother", false);
+	if (!m_node->has_parameter("enable_position_velocity_smoother"))
+		m_node->declare_parameter("enable_position_velocity_smoother", false);
+	if (!m_node->has_parameter("enable_continuous_zero_rotation_update"))
+		m_node->declare_parameter("enable_continuous_zero_rotation_update", false);
+	if (!m_node->has_parameter("enable_inrun_compass_calibration"))
+		m_node->declare_parameter("enable_inrun_compass_calibration", false);
+	if (!m_node->has_parameter("enable_rotsensor_frame_config"))
+		m_node->declare_parameter("enable_rotsensor_frame_config", false);
+	if (!m_node->has_parameter("enable_setting_baudrate"))
+		m_node->declare_parameter("enable_setting_baudrate", false);
+	if (!m_node->has_parameter("set_baudrate_value"))
+		m_node->declare_parameter("set_baudrate_value", 115200);
 	bool should_publish = true;
-	m_node->declare_parameter("pub_utctime", should_publish);
-	m_node->declare_parameter("pub_sampletime", should_publish);
-	m_node->declare_parameter("pub_imu", should_publish);
-	m_node->declare_parameter("pub_quaternion", should_publish);
-	m_node->declare_parameter("pub_euler", should_publish);
-	m_node->declare_parameter("pub_free_acceleration", should_publish);
-	m_node->declare_parameter("pub_angular_velocity", should_publish);
-	m_node->declare_parameter("pub_acceleration", should_publish);
-	m_node->declare_parameter("pub_dq", should_publish);
-	m_node->declare_parameter("pub_dv", should_publish);
-	m_node->declare_parameter("pub_mag", should_publish);
-
-	m_node->declare_parameter("pub_temperature", should_publish);
-	m_node->declare_parameter("pub_pressure", should_publish);
-	m_node->declare_parameter("pub_accelerationhr", should_publish);
-	m_node->declare_parameter("pub_angular_velocity_hr", should_publish);
-	m_node->declare_parameter("pub_transform", should_publish);
-	m_node->declare_parameter("pub_status", should_publish);
-
-	m_node->declare_parameter("pub_twist", should_publish);
-	m_node->declare_parameter("pub_gnss", should_publish);
-	m_node->declare_parameter("pub_positionLLA", should_publish);
-	m_node->declare_parameter("pub_velocity", should_publish);
-	m_node->declare_parameter("pub_nmea", should_publish);
-	m_node->declare_parameter("pub_gnsspose", should_publish);
-	m_node->declare_parameter("pub_odometry", should_publish);
-
-
+	if (!m_node->has_parameter("pub_utctime"))
+		m_node->declare_parameter("pub_utctime", should_publish);
+	if (!m_node->has_parameter("pub_sampletime"))
+		m_node->declare_parameter("pub_sampletime", should_publish);
+	if (!m_node->has_parameter("pub_imu"))
+		m_node->declare_parameter("pub_imu", should_publish);
+	if (!m_node->has_parameter("pub_quaternion"))
+		m_node->declare_parameter("pub_quaternion", should_publish);
+	if (!m_node->has_parameter("pub_euler"))
+		m_node->declare_parameter("pub_euler", should_publish);
+	if (!m_node->has_parameter("pub_free_acceleration"))
+		m_node->declare_parameter("pub_free_acceleration", should_publish);
+	if (!m_node->has_parameter("pub_angular_velocity"))
+		m_node->declare_parameter("pub_angular_velocity", should_publish);
+	if (!m_node->has_parameter("pub_acceleration"))
+		m_node->declare_parameter("pub_acceleration", should_publish);
+	if (!m_node->has_parameter("pub_dq"))
+		m_node->declare_parameter("pub_dq", should_publish);
+	if (!m_node->has_parameter("pub_dv"))
+		m_node->declare_parameter("pub_dv", should_publish);
+	if (!m_node->has_parameter("pub_mag"))
+		m_node->declare_parameter("pub_mag", should_publish);
+	if (!m_node->has_parameter("pub_temperature"))
+		m_node->declare_parameter("pub_temperature", should_publish);
+	if (!m_node->has_parameter("pub_pressure"))
+		m_node->declare_parameter("pub_pressure", should_publish);
+	if (!m_node->has_parameter("pub_accelerationhr"))
+		m_node->declare_parameter("pub_accelerationhr", should_publish);
+	if (!m_node->has_parameter("pub_angular_velocity_hr"))
+		m_node->declare_parameter("pub_angular_velocity_hr", should_publish);
+	if (!m_node->has_parameter("pub_transform"))
+		m_node->declare_parameter("pub_transform", should_publish);
+	if (!m_node->has_parameter("pub_status"))
+		m_node->declare_parameter("pub_status", should_publish);
+	if (!m_node->has_parameter("pub_twist"))
+		m_node->declare_parameter("pub_twist", should_publish);
+	if (!m_node->has_parameter("pub_gnss"))
+		m_node->declare_parameter("pub_gnss", should_publish);
+	if (!m_node->has_parameter("pub_positionLLA"))
+		m_node->declare_parameter("pub_positionLLA", should_publish);
+	if (!m_node->has_parameter("pub_velocity"))
+		m_node->declare_parameter("pub_velocity", should_publish);
+	if (!m_node->has_parameter("pub_nmea"))
+		m_node->declare_parameter("pub_nmea", should_publish);
+	if (!m_node->has_parameter("pub_gnsspose"))
+		m_node->declare_parameter("pub_gnsspose", should_publish);
+	if (!m_node->has_parameter("pub_odometry"))
+		m_node->declare_parameter("pub_odometry", should_publish);
+	if (!m_node->has_parameter("pub_gnsspvt"))
+		m_node->declare_parameter("pub_gnsspvt", should_publish);
+	if (!m_node->has_parameter("pub_gnssatinfo"))
+		m_node->declare_parameter("pub_gnssatinfo", should_publish);
+	if (!m_node->has_parameter("pub_euler_stddev"))
+		m_node->declare_parameter("pub_euler_stddev", should_publish);
+	if (!m_node->has_parameter("port_config_hardware_flow_control"))
+		m_node->declare_parameter("port_config_hardware_flow_control", should_publish);	
+	if (!m_node->has_parameter("pub_ship_motion"))
+		m_node->declare_parameter("pub_ship_motion", should_publish);
 }

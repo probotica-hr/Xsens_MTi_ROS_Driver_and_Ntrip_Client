@@ -23,14 +23,27 @@ add_library(${PROJECT_NAME}_lib
   src/ntrip_client_lifecycle.cpp
 )
 
-ament_target_dependencies(${PROJECT_NAME}_lib
-  rclcpp
-  rclcpp_lifecycle
-  nmea_msgs
-  mavros_msgs
-  diagnostic_msgs
-  std_msgs
-)
+if(COMMAND ament_target_dependencies)
+  ament_target_dependencies(${PROJECT_NAME}_lib
+    rclcpp
+    rclcpp_lifecycle
+    nmea_msgs
+    mavros_msgs
+    diagnostic_msgs
+    std_msgs
+  )
+else()
+  # ament_target_dependencies() was removed on newer ROS releases in favour of
+  # linking the exported CMake targets directly.
+  target_link_libraries(${PROJECT_NAME}_lib
+    rclcpp::rclcpp
+    rclcpp_lifecycle::rclcpp_lifecycle
+    ${nmea_msgs_TARGETS}
+    ${mavros_msgs_TARGETS}
+    ${diagnostic_msgs_TARGETS}
+    ${std_msgs_TARGETS}
+  )
+endif()
 
 target_link_libraries(${PROJECT_NAME}_lib
   Boost::system
@@ -49,13 +62,25 @@ target_link_libraries(ntrip_lifecycle
   ${PROJECT_NAME}_lib
 )
 
-ament_target_dependencies(ntrip
-  rclcpp
-)
+if(COMMAND ament_target_dependencies)
+  ament_target_dependencies(ntrip
+    rclcpp
+  )
+else()
+  target_link_libraries(ntrip
+    rclcpp::rclcpp
+  )
+endif()
 
-ament_target_dependencies(ntrip_lifecycle
-  rclcpp
-)
+if(COMMAND ament_target_dependencies)
+  ament_target_dependencies(ntrip_lifecycle
+    rclcpp
+  )
+else()
+  target_link_libraries(ntrip_lifecycle
+    rclcpp::rclcpp
+  )
+endif()
 
 install(TARGETS
   ${PROJECT_NAME}_lib
