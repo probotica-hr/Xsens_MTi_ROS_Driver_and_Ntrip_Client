@@ -260,15 +260,15 @@ void XdaInterface::registerPublishers()
 		}
 	}
 
-	//For RTK GNSS/INS MTi-8, MTi-680(G), we need to subscribe to a rostopic /rtcm.
+	//For RTK GNSS/INS MTi-8, MTi-680(G), we need to subscribe to a rostopic rtcm.
 	if(isDeviceGnssRtk)
 	{
 		m_rtcmSubscription = m_node->create_subscription<mavros_msgs::msg::RTCM>(
-			"/rtcm",
+			"rtcm",
 			100,
 			std::bind(&XdaInterface::rtcmCallback, this, std::placeholders::_1)
 		);
-		RCLCPP_INFO(m_node->get_logger(), "Subscribing to /rtcm rostopic");
+		RCLCPP_INFO(m_node->get_logger(), "Subscribing to rtcm rostopic (relative to node namespace)");
 	}
 
 }
